@@ -429,6 +429,7 @@ __global__ void gemm_bf16_kernel(
         __syncthreads();
 
         // TMA 传输
+        current_phase ^= 1;
         if(local_thread_idx == 0 && K - k_start > BK) {
             barrier_expect_tx(barrier, A_TILE_BYTES + B_TILE_BYTES);
             for(uint32_t box_row = 0; box_row < BM / A_BOX_M; box_row++) {
@@ -521,10 +522,9 @@ __global__ void gemm_bf16_kernel(
                 }
             }
         }
-        __syncthreads();
-        current_phase ^= 1;
     }
-    
+    __syncthreads();
+
     // regs -> shared
     float2* smem_c_ptr = reinterpret_cast<float2*>(smem_tileC);
     uint32_t row_offset_ctile = row_warp * (BM / WARPS_M);
