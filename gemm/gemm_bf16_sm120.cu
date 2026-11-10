@@ -1,7 +1,3 @@
-#include<stdio.h>
-#include<cuda.h>
-#include<cuda_bf16.h>
-
 #include <stdio.h>
 #include <stdint.h>
 #include <cuda.h>
