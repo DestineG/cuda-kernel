@@ -1,2 +1,8 @@
+# Generated CUDA binaries and profiling output.
 build/
+# Local experiment archives and reference files (preserved outside Git).
 docs/
+# Local Python environments and caches.
+.venv/
+__pycache__/
+*.py[cod]
