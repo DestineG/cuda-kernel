@@ -93,23 +93,30 @@ uint32_t tma_box_swizzle128B(
 }
 
 template<
-    size_t Br,
-    size_t HEAD_DIM,
-    size_t BOX_O_M,
-    size_t BOX_O_N
+    size_t TILE_M,
+    size_t TILE_N,
+    size_t BOX_M,
+    size_t BOX_N
 >
 __device__ __forceinline__
-uint32_t tma_obox_offset_swizzle128B(
+uint32_t tma_tile_offset_swizzle128B(
     uint32_t row,
     uint32_t col,
     uint32_t dtype_size
 ) {
-    uint32_t box_row = row / BOX_O_M;
-    uint32_t box_col = col / BOX_O_N;
-    uint32_t box_local_row = row % BOX_O_M;
-    uint32_t box_local_col = col % BOX_O_N;
-    uint32_t offset = box_row * BOX_O_M * HEAD_DIM + box_col * BOX_O_N * BOX_O_M;
+    uint32_t box_row = row / BOX_M;
+    uint32_t box_col = col / BOX_N;
+    uint32_t box_local_row = row % BOX_M;
+    uint32_t box_local_col = col % BOX_N;
+    uint32_t offset = box_row * BOX_M * TILE_N + box_col * BOX_N * BOX_M;
     return offset + tma_box_swizzle128B(box_local_row, box_local_col, dtype_size);
+}
+
+__device__ __forceinline__
+uint32_t pack_bf16(float x, float y) {
+    uint32_t lo = __bfloat16_as_ushort(__float2bfloat16_rn(x));
+    uint32_t hi = __bfloat16_as_ushort(__float2bfloat16_rn(y));
+    return lo | (hi << 16);
 }
 
 template<
@@ -129,9 +136,14 @@ template<
 
     size_t MMA_M,
     size_t MMA_N,
-    size_t MMA_K
+    size_t MMA_K,
+
+    bool RegRealloc = false,
+    uint32_t ProducerRegs = 40,
+    uint32_t ConsumerRegs = 232
 >
-__global__ void fa3_bf16_forward(
+__global__ __launch_bounds__(8 * WARP_SIZE, 1)
+void fa3_bf16_forward(
     const __grid_constant__ CUtensorMap tma_desc_Q,
     const __grid_constant__ CUtensorMap tma_desc_K,
     const __grid_constant__ CUtensorMap tma_desc_V,
@@ -142,8 +154,22 @@ __global__ void fa3_bf16_forward(
 
     size_t num_heads,
     size_t num_kv_heads,
-    float scale
+
+    float scale,
+    float* O
 ) {
+    // One consumer warpgroup and one producer warpgroup, 128 threads each.
+    static_assert(!RegRealloc ||
+                  (ProducerRegs >= 24 && ProducerRegs <= 256 && ProducerRegs % 8 == 0),
+                  "ProducerRegs must be a multiple of 8 in [24, 256]");
+    static_assert(!RegRealloc ||
+                  (ConsumerRegs >= 24 && ConsumerRegs <= 256 && ConsumerRegs % 8 == 0),
+                  "ConsumerRegs must be a multiple of 8 in [24, 256]");
+    static_assert(!RegRealloc || ProducerRegs <= ConsumerRegs,
+                  "ProducerRegs must not exceed ConsumerRegs");
+    static_assert(!RegRealloc || 128 * (ProducerRegs + ConsumerRegs) <= 65536,
+                  "Register targets exceed the SM90 register-file capacity");
+
     // index
     size_t seq_idx = blockIdx.z;
     size_t head_idx = blockIdx.y;
@@ -164,8 +190,11 @@ __global__ void fa3_bf16_forward(
     size_t kv_start = cu_seqlens_kv[seq_idx];
     size_t kv_end = cu_seqlens_kv[seq_idx + 1];
     size_t kv_lens = kv_end - kv_start;
+    if constexpr (CAUSAL) {
+        assert(kv_lens >= q_lens);
+    }
     size_t num_kvtiles = (kv_lens + Bc - 1) / Bc;
-    if(kv_lens <= 0) return;
+    if (kv_lens == 0) return;
     size_t kv_head_idx = head_idx / (num_heads / num_kv_heads);
     size_t num_last_kvtile_row = kv_lens - (num_kvtiles - 1) * Bc;
 
@@ -198,7 +227,20 @@ __global__ void fa3_bf16_forward(
     __syncthreads();
 
 
+    // All 128 producer threads release registers, including the idle warps.
+    // Do this before the single-thread producer branch below.
+    if constexpr (RegRealloc) {
+        if (warp_idx >= 4 && warp_idx < 8) {
+            warpgroup_reg_dealloc<ProducerRegs>();
+        }
+    }
+
     if(warp_idx < 4) {
+        // All 128 consumer threads request their target before using MMA registers.
+        if constexpr (RegRealloc) {
+            warpgroup_reg_alloc<ConsumerRegs>();
+        }
+
         // regs
         float regs_row_max[Br / 64][2];
         float regs_row_factor[Br / 64][2];
@@ -223,18 +265,48 @@ __global__ void fa3_bf16_forward(
             barrier_wait(barrier_productor, phase_productor);
             phase_productor ^= 1;
 
-            // wgmma: s = q@k
+            // s = q@k
             wgmma_fence();
-            for() {
-                for() {
-                    for() {
-                        
+            for(uint32_t mma_m = 0; mma_m < Br; mma_m += MMA_M) {
+                for(uint32_t mma_n = 0; mma_n < Bc; mma_n += MMA_N) {
+                    for(uint32_t mma_k = 0; mma_k < HEAD_DIM; mma_k += MMA_K) {
+                        // mma_desc_smem_q
+                        uint32_t offset = tma_tile_offset_swizzle128B<
+                            Br, HEAD_DIM,
+                            BOX_Q_M, BOX_Q_N
+                        >(mma_m, mma_k, sizeof(__nv_bfloat16));
+                        uint64_t mma_desc_smem_Q = create_smem_desc(
+                            smem_q + offset,
+                            16,
+                            8 * BOX_Q_N * sizeof(__nv_bfloat16),
+                            1,
+                            0
+                        );
+
+                        // mma_desc_smem_k
+                        offset = tma_tile_offset_swizzle128B<
+                            Bc, HEAD_DIM,
+                            BOX_KV_M, BOX_KV_N
+                        >(mma_n, mma_k, sizeof(__nv_bfloat16));
+                        uint64_t mma_desc_smem_K = create_smem_desc(
+                            smem_k + offset,
+                            16,
+                            8 * BOX_KV_N * sizeof(__nv_bfloat16),
+                            1,
+                            0
+                        );
+
+                        // wgmma
+                        wgmma_m64n64k16_ss(
+                            regs_sp[mma_m / MMA_M][mma_n / MMA_N],
+                            mma_desc_smem_Q,
+                            mma_desc_smem_K,
+                            mma_k != 0
+                        );
                     }
                 }
             }
-            // 打包分组
             wgmma_commit();
-            // 清空队列
             wgmma_wait<0>();
 
 
@@ -283,7 +355,7 @@ __global__ void fa3_bf16_forward(
                 }
             }
 
-            // scale & new_m = rowmax(old_m, s)
+            // new_m, factor = rowmax(old_m, s)
             for (uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
                 float new_max[2] = {-INFINITY, -INFINITY};
                 for (uint32_t mma_n = 0; mma_n < Bc / MMA_N; mma_n++) {
@@ -310,7 +382,7 @@ __global__ void fa3_bf16_forward(
                 regs_row_max[mma_m][1] = new_max[1];
             }
 
-            // p = apply_max(s) & new_l = rowsum(old_l, p, factor)
+            // new_l, p = apply_max_and_rowsum(old_l, s, new_max, factor)
             for (uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
                 float new_sum[2] = {0, 0};
                 for (uint32_t mma_n = 0; mma_n < Bc / MMA_N; mma_n++) {
@@ -333,7 +405,7 @@ __global__ void fa3_bf16_forward(
                 regs_row_sum[mma_m][1] = regs_row_sum[mma_m][1] * regs_row_factor[mma_m][1] + new_sum[1];
             }
 
-            // rescale(old_o)
+            // old_o_scale = apply_factor(old_o, factor)
             for(uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
                 for(uint32_t mma_n = 0; mma_n < HEAD_DIM / MMA_N; mma_n++) {
                     for(uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
@@ -345,62 +417,134 @@ __global__ void fa3_bf16_forward(
                 }
             }
 
-            // wgmma: old_o += p@v
-            wgmma_fence();
-            for() {
-                for() {
-                    for() {}
+            // new_o = old_o_scale + p@v
+            for(uint32_t mma_m = 0; mma_m < Br; mma_m += MMA_M) {
+                for(uint32_t mma_n = 0; mma_n < HEAD_DIM; mma_n += MMA_N) {
+                    for(uint32_t mma_k = 0; mma_k < Bc; mma_k += MMA_K) {
+                        // mma_desc_regs_p
+                        const auto& p = regs_sp[mma_m / MMA_M];
+                        uint32_t regs_p[MMA_K / 4];
+                        uint32_t dst = 0;
+                        for (uint32_t col = mma_k; col < mma_k + MMA_K; col += 8) {
+                            uint32_t fragment = col / MMA_N;
+                            uint32_t reg = (col % MMA_N) / 8 * 4;
+                            regs_p[dst++] = pack_bf16(p[fragment][reg], p[fragment][reg + 1]);
+                            regs_p[dst++] = pack_bf16(p[fragment][reg + 2], p[fragment][reg + 3]);
+                        }
+
+                        // mma_desc_smem_v
+                        uint32_t offset = tma_tile_offset_swizzle128B<
+                            Bc, HEAD_DIM,
+                            BOX_KV_M, BOX_KV_N
+                        >(mma_k, mma_n, sizeof(__nv_bfloat16));
+                        uint64_t mma_desc_smem_V = create_smem_desc(
+                            smem_v + offset,
+                            16,
+                            8 * BOX_KV_N * sizeof(__nv_bfloat16),
+                            1,
+                            0
+                        );
+
+                        // wgmma
+                        wgmma_fence();
+                        wgmma_m64n64k16_rs(
+                            regs_o[mma_m / MMA_M][mma_n / MMA_N],
+                            regs_p,
+                            mma_desc_smem_V,
+                            true
+                        );
+                    }
                 }
             }
-            // 打包分组
             wgmma_commit();
-            // 清空队列
             wgmma_wait<0>();
 
             // arrive kv consumer
             barrier_arrive(barrier_consumer);
         }
+
         // o scale
-
-        // wait productor
-        barrier_wait(barrier_productor, phase_productor);
-        phase_productor ^= 1;
-
-        // regs_o store shared
         for(uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
             uint32_t mma_row = mma_m * MMA_M + warp_idx * 16;
             for(uint32_t mma_n = 0; mma_n < HEAD_DIM / MMA_N; mma_n++) {
                 for(uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
-                    float o0 = regs_o[mma_m][mma_n][mma_n8 * 4];
-                    float o1 = regs_o[mma_m][mma_n][1 + mma_n8 * 4];
-                    float2 vec_o = {o0, o1};
-                    uint32_t elem_row = (lane_idx / 4) + mma_row;
-                    uint32_t elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8;
-                    uint32_t offset = tma_obox_offset_swizzle128B<
-                        Br, HEAD_DIM,
-                        BOX_O_M, BOX_O_N
-                    >(elem_row, elem_col, sizeof(float));
-                    float2* vec_o_ptr = reinterpret_cast<float2*>(smem_o + offset);
-                    *vec_o_ptr = vec_o;
-
-                    o0 = regs_o[mma_m][mma_n][2 + mma_n8 * 4];
-                    o1 = regs_o[mma_m][mma_n][3 + mma_n8 * 4];
-                    vec_o = {o0, o1};
-                    elem_row = (lane_idx / 4) + 8 + mma_row;
-                    elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8;
-                    offset = tma_obox_offset_swizzle128B<
-                        Br, HEAD_DIM,
-                        BOX_O_M, BOX_O_N
-                    >(elem_row, elem_col, sizeof(float));
-                    vec_o_ptr = reinterpret_cast<float2*>(smem_o + offset);
-                    *vec_o_ptr = vec_o;
+                    regs_o[mma_m][mma_n][mma_n8 * 4] /= regs_row_sum[mma_m][0];
+                    regs_o[mma_m][mma_n][1 + mma_n8 * 4] /= regs_row_sum[mma_m][0];
+                    regs_o[mma_m][mma_n][2 + mma_n8 * 4] /= regs_row_sum[mma_m][1];
+                    regs_o[mma_m][mma_n][3 + mma_n8 * 4] /= regs_row_sum[mma_m][1];
                 }
             }
         }
 
-        // arrive o consumer
-        fence_proxy_async();
-        barrier_arrive(barrier_consumer);
+        // tma store
+        if(num_qtile_row == Br) {
+            // wait productor
+            barrier_wait(barrier_productor, phase_productor);
+            phase_productor ^= 1;
+
+            // regs_o store shared
+            for(uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
+                uint32_t mma_row = mma_m * MMA_M + warp_idx * 16;
+                for(uint32_t mma_n = 0; mma_n < HEAD_DIM / MMA_N; mma_n++) {
+                    for(uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
+                        float o0 = regs_o[mma_m][mma_n][mma_n8 * 4];
+                        float o1 = regs_o[mma_m][mma_n][1 + mma_n8 * 4];
+                        float2 vec_o = {o0, o1};
+                        uint32_t elem_row = (lane_idx / 4) + mma_row;
+                        uint32_t elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8;
+                        uint32_t offset = tma_tile_offset_swizzle128B<
+                            Br, HEAD_DIM,
+                            BOX_O_M, BOX_O_N
+                        >(elem_row, elem_col, sizeof(float));
+                        float2* vec_o_ptr = reinterpret_cast<float2*>(smem_o + offset);
+                        *vec_o_ptr = vec_o;
+
+                        o0 = regs_o[mma_m][mma_n][2 + mma_n8 * 4];
+                        o1 = regs_o[mma_m][mma_n][3 + mma_n8 * 4];
+                        vec_o = {o0, o1};
+                        elem_row = (lane_idx / 4) + 8 + mma_row;
+                        elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8;
+                        offset = tma_tile_offset_swizzle128B<
+                            Br, HEAD_DIM,
+                            BOX_O_M, BOX_O_N
+                        >(elem_row, elem_col, sizeof(float));
+                        vec_o_ptr = reinterpret_cast<float2*>(smem_o + offset);
+                        *vec_o_ptr = vec_o;
+                    }
+                }
+            }
+
+            // arrive o consumer
+            fence_proxy_async();
+            barrier_arrive(barrier_consumer);
+        }
+        // regs store global
+        else {
+            size_t row_stride = num_heads * HEAD_DIM;
+            size_t head_offset = head_idx * HEAD_DIM;
+            for (uint32_t mma_m = 0; mma_m < Br / MMA_M; ++mma_m) {
+                uint32_t mma_row = mma_m * MMA_M + warp_idx * 16;
+                for (uint32_t mma_n = 0; mma_n < HEAD_DIM / MMA_N; ++mma_n) {
+                    for (uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; ++mma_n8) {
+                        uint32_t elem_row = (lane_idx / 4) + mma_row;
+                        uint32_t elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8;
+                        float2 vec_o;
+                        vec_o.x = regs_o[mma_m][mma_n][mma_n8 * 4];
+                        vec_o.y = regs_o[mma_m][mma_n][1 + mma_n8 * 4];
+                        if (elem_row < num_qtile_row) {
+                            size_t offset = (qtile_start + elem_row) * row_stride + head_offset + elem_col;
+                            *reinterpret_cast<float2*>(O + offset) = vec_o;
+                        }
+                        vec_o.x = regs_o[mma_m][mma_n][2 + mma_n8 * 4];
+                        vec_o.y = regs_o[mma_m][mma_n][3 + mma_n8 * 4];
+                        if (elem_row + 8 < num_qtile_row) {
+                            size_t offset = (qtile_start + elem_row + 8) * row_stride + head_offset + elem_col;
+                            *reinterpret_cast<float2*>(O + offset) = vec_o;
+                        }
+                    }
+                }
+            }
+        }
     }
     else if(warp_idx >=4 && warp_idx < 8) {
         if(warp_idx == 4 && lane_idx == 0) {
@@ -458,31 +602,30 @@ __global__ void fa3_bf16_forward(
                 phase_consumer ^= 1;
             }
 
-            // arrive productor
-            barrier_arrive(barrier_productor);
+            // tma store
+            if(num_qtile_row == Br) {
+                // arrive productor
+                barrier_arrive(barrier_productor);
 
-            // wait o consumer
-            barrier_wait(barrier_consumer, phase_consumer);
-            phase_consumer ^= 1;
+                // wait o consumer
+                barrier_wait(barrier_consumer, phase_consumer);
+                phase_consumer ^= 1;
 
-            // TODO: o 尾块处理
-            // 暂不处理，测试时强制 q_lens % Br == 0
-
-            // tma store o
-            for (uint32_t box_row = 0; box_row < Br; box_row += BOX_O_M) {
-                for (uint32_t box_col = 0; box_col < HEAD_DIM; box_col += BOX_O_N) {
-                    uint32_t offset = box_row * HEAD_DIM + box_col * BOX_O_M;
-                    tma_store_2d(
-                        &tma_desc_O,
-                        box_col + head_idx * HEAD_DIM,
-                        box_row + qtile_start,
-                        smem_o + offset
-                    );
+                // tma store o
+                for (uint32_t box_row = 0; box_row < Br; box_row += BOX_O_M) {
+                    for (uint32_t box_col = 0; box_col < HEAD_DIM; box_col += BOX_O_N) {
+                        uint32_t offset = box_row * HEAD_DIM + box_col * BOX_O_M;
+                        tma_store_2d(
+                            &tma_desc_O,
+                            box_col + head_idx * HEAD_DIM,
+                            box_row + qtile_start,
+                            smem_o + offset
+                        );
+                    }
                 }
+                tma_store_commit();
+                tma_store_wait();
             }
-
-            tma_store_commit();
-            tma_store_wait();
         }
     }
 }
@@ -507,7 +650,12 @@ template<
 
     size_t MMA_M = 64,
     size_t MMA_N = 64,
-    size_t MMA_K = 16
+    size_t MMA_K = 16,
+
+    // Compile-time targets per thread; ignored when RegRealloc is false.
+    bool RegRealloc = false,
+    uint32_t ProducerRegs = 40,
+    uint32_t ConsumerRegs = 232
 >
 void fa3_bf16_forward_launcher(
     const __nv_bfloat16* Q,
@@ -527,18 +675,6 @@ void fa3_bf16_forward_launcher(
 
     cudaStream_t stream = nullptr
 ) {
-    // mma
-    static_assert(MMA_M == 64 && MMA_N == 64 && MMA_K == 16);
-
-    // q@k
-    static_assert(Br % MMA_M == 0);
-    static_assert(Bc % MMA_N == 0);
-    static_assert(HEAD_DIM % MMA_K == 0);
-
-    // p@v
-    static_assert(Br % MMA_M == 0);
-    static_assert(HEAD_DIM % MMA_N == 0);
-
     // tma
     static_assert(Br % BOX_Q_M == 0);
     static_assert(HEAD_DIM % BOX_Q_N == 0);
@@ -551,6 +687,16 @@ void fa3_bf16_forward_launcher(
     static_assert(BOX_Q_N * sizeof(__nv_bfloat16) == 128);
     static_assert(BOX_KV_N * sizeof(__nv_bfloat16) == 128);
     static_assert(BOX_O_N * sizeof(float) == 128);
+
+    // mma
+    static_assert(MMA_M == 64 && MMA_N == 64 && MMA_K == 16);
+    static_assert(MMA_N % 8 == 0);
+
+    // q@k & p@v
+    static_assert(BOX_Q_M % MMA_M == 0);
+    static_assert(BOX_Q_N % MMA_K == 0);
+    static_assert(BOX_KV_M % MMA_N == 0);
+    static_assert(BOX_KV_N % MMA_K == 0);
 
     // head
     assert(num_heads > 0 && num_kv_heads > 0);
@@ -595,7 +741,8 @@ void fa3_bf16_forward_launcher(
         BOX_Q_M, BOX_Q_N,
         BOX_KV_M, BOX_KV_N,
         BOX_O_M, BOX_O_N,
-        MMA_M, MMA_N, MMA_K
+        MMA_M, MMA_N, MMA_K,
+        RegRealloc, ProducerRegs, ConsumerRegs
     >;
     cudaError_t err = cudaFuncSetAttribute(
         kernel,
@@ -616,7 +763,8 @@ void fa3_bf16_forward_launcher(
         cu_seqlens_kv,
         num_heads,
         num_kv_heads,
-        1 / sqrtf(HEAD_DIM)
+        1 / sqrtf(HEAD_DIM),
+        O
     );
     err = cudaGetLastError();
     if (err != cudaSuccess) return;

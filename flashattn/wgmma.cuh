@@ -37,6 +37,7 @@ uint64_t create_smem_desc(
         (uint64_t(swizzle_mode & 0x3)       << 62);
 }
 
+// 保证此前对 WGMMA 操作数寄存器的访问（如打包 regs_p、缩放 regs_o）先于后续 WGMMA 对这些寄存器的访问
 __device__ __forceinline__
 void wgmma_fence() {
     asm volatile(
@@ -48,7 +49,7 @@ void wgmma_fence() {
 }
 
 __device__ __forceinline__
-void wgmma_m64n64k16(
+void wgmma_m64n64k16_ss(
     float (&d)[32],
     uint64_t desc_a,
     uint64_t desc_b,
@@ -83,6 +84,41 @@ void wgmma_m64n64k16(
 }
 
 __device__ __forceinline__
+void wgmma_m64n64k16_rs(
+    float (&d)[32],
+    const uint32_t (&a)[4],
+    uint64_t desc_b,
+    bool accumulate = true
+) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %37, 0;\n\t"
+
+        "wgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 "
+        "{%0,  %1,  %2,  %3,  %4,  %5,  %6,  %7, "
+        " %8,  %9,  %10, %11, %12, %13, %14, %15, "
+        " %16, %17, %18, %19, %20, %21, %22, %23, "
+        " %24, %25, %26, %27, %28, %29, %30, %31}, "
+        "{%32, %33, %34, %35}, %36, p, 1, 1, 1;\n\t"
+        "}\n"
+        : "+f"(d[0]),  "+f"(d[1]),  "+f"(d[2]),  "+f"(d[3]),
+          "+f"(d[4]),  "+f"(d[5]),  "+f"(d[6]),  "+f"(d[7]),
+          "+f"(d[8]),  "+f"(d[9]),  "+f"(d[10]), "+f"(d[11]),
+          "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]),
+          "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]),
+          "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]),
+          "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]),
+          "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "l"(desc_b),
+          "r"(static_cast<int>(accumulate))
+        : "memory"
+    );
+}
+
+// 打包分组
+__device__ __forceinline__
 void wgmma_commit() {
     asm volatile(
         "wgmma.commit_group.sync.aligned;"
@@ -92,6 +128,7 @@ void wgmma_commit() {
     );
 }
 
+// 清空队列
 template<int N = 0>
 __device__ __forceinline__
 void wgmma_wait() {
@@ -100,5 +137,31 @@ void wgmma_wait() {
         :
         : "n"(N)
         : "memory"
+    );
+}
+
+template<uint32_t RegCount>
+__device__ __forceinline__
+void warpgroup_reg_alloc() {
+    static_assert(RegCount >= 24 && RegCount <= 256);
+    static_assert(RegCount % 8 == 0);
+
+    asm volatile(
+        "setmaxnreg.inc.sync.aligned.u32 %0;"
+        :
+        : "n"(RegCount)
+    );
+}
+
+template<uint32_t RegCount>
+__device__ __forceinline__
+void warpgroup_reg_dealloc() {
+    static_assert(RegCount >= 24 && RegCount <= 256);
+    static_assert(RegCount % 8 == 0);
+
+    asm volatile(
+        "setmaxnreg.dec.sync.aligned.u32 %0;"
+        :
+        : "n"(RegCount)
     );
 }
