@@ -1,0 +1,22 @@
+[
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer",
+    "label": "double_V_FP32",
+    "source": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer",
+    "k_stages": 1,
+    "v_stages": 2,
+    "barrier_bytes": 64,
+    "output_dtype": "fp32"
+  },
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer_bf16_output",
+    "label": "double_V_BF16",
+    "source": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer_bf16_output.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer_bf16_output",
+    "k_stages": 1,
+    "v_stages": 2,
+    "barrier_bytes": 64,
+    "output_dtype": "bf16"
+  }
+]

@@ -1,0 +1,457 @@
+--- fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer.cu
++++ fa3_v_bf16_pingpong.cu
+@@ -1,3 +1,9 @@
++// Isolated V double-buffer BF16 experiment: pingpong.
++// Br denotes rows PER consumer; CTA rows=2*Br. Both WGs release K/V.
++// QK-ready handoff overlaps one WG softmax with the other WG MMA.
++// This is an experimental two-consumer schedule, not a verbatim official FA3 kernel.
++// Isolated experiment: FP32 accumulation, round-to-nearest-even BF16 output.
++// Full tiles: packed BF16 shared stores + BF16 TMA; tails: packed BF16 global stores.
+ // Independent K/V ring slots, derived from the v1 combined baseline.
+ // Derived from fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1.cu; combined compile and causal-mask optimizations.
+ #include<stdint.h>
+@@ -144,8 +150,8 @@
+     uint32_t ProducerRegs = 40,
+     uint32_t ConsumerRegs = 232
+ >
+-__global__ __launch_bounds__(8 * WARP_SIZE, 1)
+-void fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer(
++__global__ __launch_bounds__(12 * WARP_SIZE, 1)
++void fa3_v_bf16_pingpong(
+     const __grid_constant__ CUtensorMap tma_desc_Q,
+     const __grid_constant__ CUtensorMap tma_desc_K,
+     const __grid_constant__ CUtensorMap tma_desc_V,
+@@ -158,9 +164,9 @@
+     size_t num_kv_heads,
+ 
+     float scale,
+-    float* O
++    __nv_bfloat16* O
+ ) {
+-    // One consumer warpgroup and one producer warpgroup, 128 threads each.
++    // Two consumer warpgroups and one producer warpgroup, 128 threads each.
+     static_assert(!RegRealloc ||
+                   (ProducerRegs >= 24 && ProducerRegs <= 256 && ProducerRegs % 8 == 0),
+                   "ProducerRegs must be a multiple of 8 in [24, 256]");
+@@ -169,24 +175,30 @@
+                   "ConsumerRegs must be a multiple of 8 in [24, 256]");
+     static_assert(!RegRealloc || ProducerRegs <= ConsumerRegs,
+                   "ProducerRegs must not exceed ConsumerRegs");
+-    static_assert(!RegRealloc || 128 * (ProducerRegs + ConsumerRegs) <= 65536,
+-                  "Register targets exceed the SM90 register-file capacity");
++    // setmaxnreg redistributes the CTA launch pool; it does not obtain the
++    // remaining registers of the SM. 384 threads at 168 registers = 64512.
++    static_assert(!RegRealloc || 128 * (ProducerRegs + 2 * ConsumerRegs) <= 64512,
++                  "Register targets exceed the 384-thread CTA launch pool (168 registers/thread)");
+ 
+     // index
+     size_t seq_idx = blockIdx.z;
+     size_t head_idx = blockIdx.y;
+     size_t qtile_idx = blockIdx.x;
+     size_t local_thread_idx = threadIdx.x;
+-    size_t warp_idx = local_thread_idx / WARP_SIZE;
++    size_t wg_idx = local_thread_idx / 128;
++    size_t consumer_idx = wg_idx < 2 ? wg_idx : 0;
++    size_t warp_idx = (local_thread_idx / WARP_SIZE) % 4;
+     size_t lane_idx = local_thread_idx % WARP_SIZE;
+ 
+     // Q
+     size_t q_start = cu_seqlens_q[seq_idx];
+     size_t q_end = cu_seqlens_q[seq_idx + 1];
+     size_t q_lens = q_end - q_start;
+-    size_t qtile_start = q_start + qtile_idx * Br;
+-    if(qtile_start >= q_end) return;
+-    size_t num_qtile_row = min(Br, q_end - qtile_start);
++    size_t cta_q_start = q_start + qtile_idx * (2 * Br);
++    if(cta_q_start >= q_end) return;
++    size_t cta_q_rows = min(2 * Br, q_end - cta_q_start);
++    size_t qtile_start = cta_q_start + consumer_idx * Br;
++    size_t num_qtile_row = qtile_start < q_end ? min(Br, q_end - qtile_start) : 0;
+ 
+     // KV
+     size_t kv_start = cu_seqlens_kv[seq_idx];
+@@ -202,11 +214,11 @@
+     if (kv_lens == 0) return;
+ 
+     // Sequence-local Q row range. Both warpgroups use the same KV limit.
+-    const size_t q_row_begin = qtile_idx * Br;
++    const size_t q_row_begin = qtile_idx * (2 * Br) + consumer_idx * Br;
+     size_t kv_limit = kv_lens;
+     if constexpr (CAUSAL) {
+         // Exclusive K end allowed by the last valid query row (bottom-right mask).
+-        kv_limit = kv_lens - q_lens + q_row_begin + num_qtile_row;
++        kv_limit = kv_lens - q_lens + qtile_idx * (2 * Br) + cta_q_rows;
+     }
+     size_t num_kvtiles = (kv_limit + Bc - 1) / Bc;
+     size_t kv_head_idx = head_idx / (num_heads / num_kv_heads);
+@@ -217,12 +229,12 @@
+     constexpr size_t V_STAGES = 2;
+ 
+     // shared
+-    size_t Q_TILE_BYTES = Br * HEAD_DIM * sizeof(__nv_bfloat16);
++    size_t Q_TILE_BYTES = 2 * Br * HEAD_DIM * sizeof(__nv_bfloat16);
+     size_t KV_TILE_BYTES = Bc * HEAD_DIM * sizeof(__nv_bfloat16);
+-    size_t O_TILE_BYTES = Br * HEAD_DIM * sizeof(float);
++    size_t O_TILE_BYTES = Br * HEAD_DIM * sizeof(__nv_bfloat16);
+     extern __shared__ __align__(1024) char smem[];
+     __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(
+-        smem
++        smem + consumer_idx * Br * HEAD_DIM * sizeof(__nv_bfloat16)
+     );
+     __nv_bfloat16* smem_k = reinterpret_cast<__nv_bfloat16*>(
+         smem + Q_TILE_BYTES
+@@ -230,7 +242,7 @@
+     __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(
+         smem + Q_TILE_BYTES + K_STAGES * KV_TILE_BYTES
+     );
+-    float* smem_o = reinterpret_cast<float*>(smem);
++    __nv_bfloat16* smem_o = reinterpret_cast<__nv_bfloat16*>(smem) + consumer_idx * Br * HEAD_DIM;
+     uint64_t* barrier = reinterpret_cast<uint64_t*>(
+         smem + Q_TILE_BYTES + (K_STAGES + V_STAGES) * KV_TILE_BYTES
+     );
+@@ -242,35 +254,40 @@
+     uint64_t* barrier_k_free = barrier_k_ready + K_STAGES;
+     uint64_t* barrier_v_ready = barrier_k_free + K_STAGES;
+     uint64_t* barrier_v_free = barrier_v_ready + V_STAGES;
++    uint64_t* turn = barrier_v_free + V_STAGES;
+     if (local_thread_idx == 0) {
++        barrier_init(turn, 1);
++        barrier_init(turn + 1, 1);
+         barrier_init(barrier_q_ready, 1);
+-        barrier_init(barrier_q_free, 4 * WARP_SIZE);
++        barrier_init(barrier_q_free, 8 * WARP_SIZE);
+         for (size_t slot = 0; slot < K_STAGES; ++slot) {
+             barrier_init(barrier_k_ready + slot, 1);
+-            barrier_init(barrier_k_free + slot, 4 * WARP_SIZE);
++            barrier_init(barrier_k_free + slot, 8 * WARP_SIZE);
+         }
+         for (size_t slot = 0; slot < V_STAGES; ++slot) {
+             barrier_init(barrier_v_ready + slot, 1);
+-            barrier_init(barrier_v_free + slot, 4 * WARP_SIZE);
++            barrier_init(barrier_v_free + slot, 8 * WARP_SIZE);
+         }
+     }
+     __syncthreads();
++    if (local_thread_idx == 0) barrier_arrive(turn); // WG0 owns the first turn.
+ 
+ 
+     // All 128 producer threads release registers, including the idle warps.
+     // Do this before the single-thread producer branch below.
+     if constexpr (RegRealloc) {
+-        if (warp_idx >= 4 && warp_idx < 8) {
++        if (wg_idx == 2) {
+             warpgroup_reg_dealloc<ProducerRegs>();
+         }
+     }
+ 
+-    if(warp_idx < 4) {
++    if(wg_idx < 2) {
+         // All 128 consumer threads request their target before using MMA registers.
+         if constexpr (RegRealloc) {
+             warpgroup_reg_alloc<ConsumerRegs>();
+         }
+ 
++        uint32_t turn_phase = 0;
+         // regs
+         float regs_row_max[Br / 64][2];
+         float regs_row_factor[Br / 64][2];
+@@ -302,6 +319,8 @@
+             barrier_wait(barrier_k_ready + k_slot, phase_k_ready[k_slot]);
+             phase_k_ready[k_slot] ^= 1;
+ 
++            barrier_wait(turn + consumer_idx, turn_phase);
++            turn_phase ^= 1;
+             // s = q@k
+             wgmma_fence();
+             for(uint32_t mma_m = 0; mma_m < Br; mma_m += MMA_M) {
+@@ -349,6 +368,7 @@
+             wgmma_wait<0>();
+ 
+ 
++            if (warp_idx == 0 && lane_idx == 0) barrier_arrive(turn + (1 - consumer_idx));
+             // arrive k consumer
+             barrier_arrive(barrier_k_free + k_slot);
+ 
+@@ -379,7 +399,7 @@
+                         uint32_t mma_row = mma_m * MMA_M + warp_idx * 16;
+                         for (uint32_t mma_n = 0; mma_n < Bc / MMA_N; mma_n++) {
+                             for (uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
+-                                size_t elem_row = (lane_idx / 4) + mma_row + qtile_idx * Br + kv_lens - q_lens;
++                                size_t elem_row = (lane_idx / 4) + mma_row + q_row_begin + kv_lens - q_lens;
+                                 uint32_t elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8 + kvtile_offset;
+                                 if(elem_row < elem_col) {
+                                     regs_sp[mma_m][mma_n][mma_n8 * 4] = -INFINITY;
+@@ -490,6 +510,8 @@
+             barrier_wait(barrier_k_ready + k_slot, phase_k_ready[k_slot]);
+             phase_k_ready[k_slot] ^= 1;
+ 
++            barrier_wait(turn + consumer_idx, turn_phase);
++            turn_phase ^= 1;
+             // s = q@k
+             wgmma_fence();
+             for(uint32_t mma_m = 0; mma_m < Br; mma_m += MMA_M) {
+@@ -583,6 +605,7 @@
+             wgmma_wait<1>();
+ 
+ 
++            if (warp_idx == 0 && lane_idx == 0) barrier_arrive(turn + (1 - consumer_idx));
+             // arrive k consumer
+             barrier_arrive(barrier_k_free + k_slot);
+ 
+@@ -613,7 +636,7 @@
+                         uint32_t mma_row = mma_m * MMA_M + warp_idx * 16;
+                         for (uint32_t mma_n = 0; mma_n < Bc / MMA_N; mma_n++) {
+                             for (uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
+-                                size_t elem_row = (lane_idx / 4) + mma_row + qtile_idx * Br + kv_lens - q_lens;
++                                size_t elem_row = (lane_idx / 4) + mma_row + q_row_begin + kv_lens - q_lens;
+                                 uint32_t elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8 + kvtile_offset;
+                                 if(elem_row < elem_col) {
+                                     regs_sp[mma_m][mma_n][mma_n8 * 4] = -INFINITY;
+@@ -727,6 +750,8 @@
+         barrier_wait(barrier_v_ready + v_slot, phase_v_ready[v_slot]);
+         phase_v_ready[v_slot] ^= 1;
+ 
++        barrier_wait(turn + consumer_idx, turn_phase);
++        turn_phase ^= 1;
+         // new_o = old_o_scale + p@v
+         for(uint32_t mma_m = 0; mma_m < Br; mma_m += MMA_M) {
+             for(uint32_t mma_n = 0; mma_n < HEAD_DIM; mma_n += MMA_N) {
+@@ -770,6 +795,7 @@
+         wgmma_commit();
+         wgmma_wait<0>();
+ 
++        if (warp_idx == 0 && lane_idx == 0) barrier_arrive(turn + (1 - consumer_idx));
+         // o scale
+         for(uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
+             uint32_t mma_row = mma_m * MMA_M + warp_idx * 16;
+@@ -783,11 +809,11 @@
+             }
+         }
+ 
+-        // tma store
++        // Each WG owns a separate Q/O region. Both still acknowledge the
++        // epilogue when one has no valid rows, so the producer cannot deadlock.
++        barrier_wait(barrier_q_ready, phase_q_ready);
++        phase_q_ready ^= 1;
+         if(num_qtile_row == Br) {
+-            // Producer has drained every outstanding K slot before sharing Q storage.
+-            barrier_wait(barrier_q_ready, phase_q_ready);
+-            phase_q_ready ^= 1;
+ 
+             // regs_o store shared
+             for(uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
+@@ -796,26 +822,26 @@
+                     for(uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
+                         float o0 = regs_o[mma_m][mma_n][mma_n8 * 4];
+                         float o1 = regs_o[mma_m][mma_n][1 + mma_n8 * 4];
+-                        float2 vec_o = {o0, o1};
++                        uint32_t vec_o = pack_bf16(o0, o1);
+                         uint32_t elem_row = (lane_idx / 4) + mma_row;
+                         uint32_t elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8;
+                         uint32_t offset = tma_tile_offset_swizzle128B<
+                             Br, HEAD_DIM,
+                             BOX_O_M, BOX_O_N
+-                        >(elem_row, elem_col, sizeof(float));
+-                        float2* vec_o_ptr = reinterpret_cast<float2*>(smem_o + offset);
++                        >(elem_row, elem_col, sizeof(__nv_bfloat16));
++                        uint32_t* vec_o_ptr = reinterpret_cast<uint32_t*>(smem_o + offset);
+                         *vec_o_ptr = vec_o;
+ 
+                         o0 = regs_o[mma_m][mma_n][2 + mma_n8 * 4];
+                         o1 = regs_o[mma_m][mma_n][3 + mma_n8 * 4];
+-                        vec_o = {o0, o1};
++                        vec_o = pack_bf16(o0, o1);
+                         elem_row = (lane_idx / 4) + 8 + mma_row;
+                         elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8;
+                         offset = tma_tile_offset_swizzle128B<
+                             Br, HEAD_DIM,
+                             BOX_O_M, BOX_O_N
+-                        >(elem_row, elem_col, sizeof(float));
+-                        vec_o_ptr = reinterpret_cast<float2*>(smem_o + offset);
++                        >(elem_row, elem_col, sizeof(__nv_bfloat16));
++                        vec_o_ptr = reinterpret_cast<uint32_t*>(smem_o + offset);
+                         *vec_o_ptr = vec_o;
+                     }
+                 }
+@@ -823,7 +849,6 @@
+ 
+             // arrive o consumer
+             fence_proxy_async();
+-            barrier_arrive(barrier_q_free);
+         }
+         // regs store global
+         else {
+@@ -840,21 +865,23 @@
+                         vec_o.y = regs_o[mma_m][mma_n][1 + mma_n8 * 4];
+                         if (elem_row < num_qtile_row) {
+                             size_t offset = (qtile_start + elem_row) * row_stride + head_offset + elem_col;
+-                            *reinterpret_cast<float2*>(O + offset) = vec_o;
++                            *reinterpret_cast<uint32_t*>(O + offset) = pack_bf16(vec_o.x, vec_o.y);
+                         }
+                         vec_o.x = regs_o[mma_m][mma_n][2 + mma_n8 * 4];
+                         vec_o.y = regs_o[mma_m][mma_n][3 + mma_n8 * 4];
+                         if (elem_row + 8 < num_qtile_row) {
+                             size_t offset = (qtile_start + elem_row + 8) * row_stride + head_offset + elem_col;
+-                            *reinterpret_cast<float2*>(O + offset) = vec_o;
++                            *reinterpret_cast<uint32_t*>(O + offset) = pack_bf16(vec_o.x, vec_o.y);
+                         }
+                     }
+                 }
+             }
+         }
++        fence_proxy_async();
++        barrier_arrive(barrier_q_free);
+     }
+-    else if(warp_idx >=4 && warp_idx < 8) {
+-        if(warp_idx == 4 && lane_idx == 0) {
++    else if(wg_idx == 2) {
++        if(local_thread_idx == 256) {
+             uint32_t phase_q_free = 0;
+             uint32_t phase_k_free[K_STAGES] = {};
+             uint32_t phase_v_free[V_STAGES] = {};
+@@ -864,14 +891,14 @@
+                 barrier_q_ready,
+                 Q_TILE_BYTES
+             );
+-            for(uint32_t box_row = 0; box_row < Br; box_row += BOX_Q_M) {
++            for(uint32_t box_row = 0; box_row < 2 * Br; box_row += BOX_Q_M) {
+                 for(uint32_t box_col = 0; box_col < HEAD_DIM; box_col += BOX_Q_N) {
+                     uint32_t offset_smem = box_row * HEAD_DIM + box_col * BOX_Q_M;
+                     tma_load_2d(
+                         smem_q + offset_smem,
+                         &tma_desc_Q,
+                         box_col + head_idx * HEAD_DIM,
+-                        box_row + qtile_start,
++                        box_row + cta_q_start,
+                         barrier_q_ready
+                     );
+                 }
+@@ -944,30 +971,23 @@
+                 phase_k_free[slot] ^= 1;
+             }
+ 
+-            // tma store
+-            if(num_qtile_row == Br) {
+-                // arrive productor
+-                barrier_arrive(barrier_q_ready);
+-
+-                // wait o consumer
+-                barrier_wait(barrier_q_free, phase_q_free);
+-                phase_q_free ^= 1;
+-
+-                // tma store o
++            // Release the epilogue after both readers have released every K.
++            // Every consumer has also finished its own final PV before arriving.
++            barrier_arrive(barrier_q_ready);
++            barrier_wait(barrier_q_free, phase_q_free);
++            phase_q_free ^= 1;
++            for (uint32_t consumer = 0; consumer < 2; ++consumer) {
++                if (cta_q_rows < (consumer + 1) * Br) continue;
+                 for (uint32_t box_row = 0; box_row < Br; box_row += BOX_O_M) {
+                     for (uint32_t box_col = 0; box_col < HEAD_DIM; box_col += BOX_O_N) {
+-                        uint32_t offset = box_row * HEAD_DIM + box_col * BOX_O_M;
+-                        tma_store_2d(
+-                            &tma_desc_O,
+-                            box_col + head_idx * HEAD_DIM,
+-                            box_row + qtile_start,
+-                            smem_o + offset
+-                        );
+-                    }
+-                }
+-                tma_store_commit();
+-                tma_store_wait();
+-            }
++                        uint32_t offset = consumer * Br * HEAD_DIM + box_row * HEAD_DIM + box_col * BOX_O_M;
++                        tma_store_2d(&tma_desc_O, box_col + head_idx * HEAD_DIM,
++                                     cta_q_start + consumer * Br + box_row, smem_o + offset);
++                    }
++                }
++            }
++            tma_store_commit();
++            tma_store_wait();
+         }
+     }
+ }
+@@ -988,7 +1008,7 @@
+     size_t BOX_KV_N = 64,
+ 
+     size_t BOX_O_M = 64,
+-    size_t BOX_O_N = 32,
++    size_t BOX_O_N = 64,
+ 
+     size_t MMA_M = 64,
+     size_t MMA_N = 64,
+@@ -999,11 +1019,11 @@
+     uint32_t ProducerRegs = 40,
+     uint32_t ConsumerRegs = 232
+ >
+-void fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer_launcher(
++void fa3_v_bf16_pingpong_launcher(
+     const __nv_bfloat16* Q,
+     const __nv_bfloat16* K,
+     const __nv_bfloat16* V,
+-    float* O,
++    __nv_bfloat16* O,
+ 
+     const size_t* cu_seqlens_q,
+     const size_t* cu_seqlens_kv,
+@@ -1028,7 +1048,7 @@
+     // tma swizzle128B
+     static_assert(BOX_Q_N * sizeof(__nv_bfloat16) == 128);
+     static_assert(BOX_KV_N * sizeof(__nv_bfloat16) == 128);
+-    static_assert(BOX_O_N * sizeof(float) == 128);
++    static_assert(BOX_O_N * sizeof(__nv_bfloat16) == 128);
+ 
+     // mma
+     static_assert(MMA_M == 64 && MMA_N == 64 && MMA_K == 16);
+@@ -1046,13 +1066,13 @@
+ 
+ 
+     // smem
+-    constexpr size_t Q_BYTES = Br * HEAD_DIM * sizeof(__nv_bfloat16);
++    constexpr size_t Q_BYTES = 2 * Br * HEAD_DIM * sizeof(__nv_bfloat16);
+     constexpr size_t K_BYTES = Bc * HEAD_DIM * sizeof(__nv_bfloat16);
+     constexpr size_t V_BYTES = Bc * HEAD_DIM * sizeof(__nv_bfloat16);
+-    constexpr size_t O_BYTES = Br * HEAD_DIM * sizeof(float);
++    constexpr size_t O_BYTES = Br * HEAD_DIM * sizeof(__nv_bfloat16);
+     constexpr size_t K_STAGES = 1;
+     constexpr size_t V_STAGES = 2;
+-    constexpr size_t MBARRIER_BYTES = (2 + 2 * K_STAGES + 2 * V_STAGES) * sizeof(uint64_t);
++    constexpr size_t MBARRIER_BYTES = (4 + 2 * K_STAGES + 2 * V_STAGES) * sizeof(uint64_t);
+     constexpr size_t DATA_BYTES = Q_BYTES + K_STAGES * K_BYTES + V_STAGES * V_BYTES;
+     constexpr size_t SMEM_BYTES = DATA_BYTES + MBARRIER_BYTES;
+     static_assert(O_BYTES <= DATA_BYTES);
+@@ -1067,7 +1087,7 @@
+     size_t KV_row_stride = KV_N * sizeof(__nv_bfloat16);
+     size_t O_M = total_q_tokens;
+     size_t O_N = num_heads * HEAD_DIM;
+-    size_t O_row_stride = O_N * sizeof(float);
++    size_t O_row_stride = O_N * sizeof(__nv_bfloat16);
+     if(
+         !create_tma_descriptor_swizzle128B<BOX_Q_M, BOX_Q_N>(
+             Q, Q_M, Q_N, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, &tma_desc_Q, Q_row_stride)
+@@ -1076,11 +1096,11 @@
+         || !create_tma_descriptor_swizzle128B<BOX_KV_M, BOX_KV_N>(
+             V, KV_M, KV_N, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, &tma_desc_V, KV_row_stride)
+         || !create_tma_descriptor_swizzle128B<BOX_O_M, BOX_O_N>(
+-            O, O_M, O_N, CU_TENSOR_MAP_DATA_TYPE_FLOAT32, &tma_desc_O, O_row_stride)
++            O, O_M, O_N, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, &tma_desc_O, O_row_stride)
+     ) return;
+ 
+     // shared opt
+-    auto kernel = fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer<
++    auto kernel = fa3_v_bf16_pingpong<
+         Br, Bc, HEAD_DIM, CAUSAL,
+         BOX_Q_M, BOX_Q_N,
+         BOX_KV_M, BOX_KV_N,
+@@ -1096,8 +1116,8 @@
+     if (err != cudaSuccess) return;
+ 
+     // kernel call
+-    dim3 grid((max_q_len + Br - 1) / Br, num_heads, batch_size);
+-    dim3 block((4 + 4) * WARP_SIZE);
++    dim3 grid((max_q_len + 2 * Br - 1) / (2 * Br), num_heads, batch_size);
++    dim3 block((4 + 4 + 4) * WARP_SIZE);
+     kernel<<<grid, block, SMEM_BYTES, stream>>>(
+         tma_desc_Q,
+         tma_desc_K,

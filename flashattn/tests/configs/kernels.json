@@ -1,0 +1,92 @@
+[
+  {
+    "id": "fa3_bf16_sm90",
+    "label": "basic",
+    "source": "fa3_bf16_sm90.cu",
+    "symbol": "fa3_bf16_forward",
+    "k_stages": 1,
+    "v_stages": 1,
+    "barrier_bytes": 16
+  },
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline",
+    "label": "pipeline",
+    "source": "fa3_bf16_sm90_kv_pipeline.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline",
+    "k_stages": 1,
+    "v_stages": 1,
+    "barrier_bytes": 32
+  },
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap",
+    "label": "overlap",
+    "source": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline_qk_pv_overlap",
+    "k_stages": 1,
+    "v_stages": 1,
+    "barrier_bytes": 32
+  },
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1",
+    "label": "v1",
+    "source": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1",
+    "k_stages": 1,
+    "v_stages": 1,
+    "barrier_bytes": 32
+  },
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_opt",
+    "label": "v1_compile",
+    "source": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_opt.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_opt",
+    "k_stages": 1,
+    "v_stages": 1,
+    "barrier_bytes": 32
+  },
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_mask_opt",
+    "label": "v1_mask",
+    "source": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_mask_opt.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_mask_opt",
+    "k_stages": 1,
+    "v_stages": 1,
+    "barrier_bytes": 32
+  },
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt",
+    "label": "combined",
+    "source": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt",
+    "k_stages": 1,
+    "v_stages": 1,
+    "barrier_bytes": 32
+  },
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_k_dbuffer",
+    "label": "double_K",
+    "source": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_k_dbuffer.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_k_dbuffer",
+    "k_stages": 2,
+    "v_stages": 1,
+    "barrier_bytes": 64
+  },
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer",
+    "label": "double_V",
+    "source": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer",
+    "k_stages": 1,
+    "v_stages": 2,
+    "barrier_bytes": 64
+  },
+  {
+    "id": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_kv_dbuffer",
+    "label": "double_KV",
+    "source": "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_kv_dbuffer.cu",
+    "symbol": "fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_kv_dbuffer",
+    "k_stages": 2,
+    "v_stages": 2,
+    "barrier_bytes": 80
+  }
+]

@@ -1,0 +1,14 @@
+{
+  "status": "COMPLETE",
+  "kernel_count": 6,
+  "performance_cases": 268,
+  "performance_records": 4690,
+  "all_record_status": {
+    "PASS": 14431,
+    "EXPECTED_NO_WRITE": 33,
+    "EXCLUDED": 44,
+    "UNSUPPORTED": 120
+  },
+  "successful_tasks": 329,
+  "selected_configs": 15
+}

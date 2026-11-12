@@ -1,0 +1,82 @@
+{
+  "name": "all-fa3-full",
+  "kernels": "kernels.json",
+  "correctness": "../cases/correctness.json",
+  "performance": "../cases/performance.json",
+  "nvcc": "/usr/local/cuda-12.4/bin/nvcc",
+  "build_jobs": 3,
+  "build_timeout_s": 240,
+  "worker_timeout_s": 600,
+  "sanitizer_timeout_s": 90,
+  "architecture": "sm_90a",
+  "source_root": "../..",
+  "search": {
+    "tiles": [
+      [
+        64,
+        64
+      ],
+      [
+        64,
+        128
+      ],
+      [
+        128,
+        64
+      ],
+      [
+        128,
+        128
+      ],
+      [
+        64,
+        256
+      ],
+      [
+        128,
+        256
+      ]
+    ],
+    "producer_regs": [
+      32,
+      40,
+      48,
+      64
+    ],
+    "consumer_regs": [
+      128,
+      160,
+      192,
+      224,
+      232,
+      240,
+      256
+    ],
+    "register_tiles_per_group": 1,
+    "joint_tiles_per_group": 2,
+    "joint_register_pairs": 3,
+    "box_rows": [
+      64,
+      128
+    ]
+  },
+  "timing": {
+    "warmup": 4,
+    "graph_nodes": 8,
+    "rounds": 5,
+    "target_round_ms": 5,
+    "max_graph_replays": 128,
+    "wall_repeats": 20
+  },
+  "validation": {
+    "repeats": 3,
+    "atol": 0.008,
+    "rtol": 0.02,
+    "sharp_atol": 0.02
+  },
+  "baselines": [
+    "official_fa3",
+    "torch_aten_varlen",
+    "torch_flash_perseq"
+  ]
+}

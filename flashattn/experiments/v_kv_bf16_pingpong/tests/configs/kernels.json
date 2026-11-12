@@ -1,0 +1,74 @@
+[
+  {
+    "id": "fa3_v_bf16_single",
+    "label": "V_BF16_single",
+    "source": "fa3_v_bf16_single.cu",
+    "symbol": "fa3_v_bf16_single",
+    "k_stages": 1,
+    "v_stages": 2,
+    "barrier_bytes": 64,
+    "output_dtype": "bf16",
+    "consumer_wgs": 1,
+    "pingpong": false
+  },
+  {
+    "id": "fa3_v_bf16_dual",
+    "label": "V_BF16_dual",
+    "source": "fa3_v_bf16_dual.cu",
+    "symbol": "fa3_v_bf16_dual",
+    "k_stages": 1,
+    "v_stages": 2,
+    "barrier_bytes": 64,
+    "output_dtype": "bf16",
+    "consumer_wgs": 2,
+    "pingpong": false
+  },
+  {
+    "id": "fa3_v_bf16_pingpong",
+    "label": "V_BF16_pingpong",
+    "source": "fa3_v_bf16_pingpong.cu",
+    "symbol": "fa3_v_bf16_pingpong",
+    "k_stages": 1,
+    "v_stages": 2,
+    "barrier_bytes": 80,
+    "output_dtype": "bf16",
+    "consumer_wgs": 2,
+    "pingpong": true
+  },
+  {
+    "id": "fa3_kv_bf16_single",
+    "label": "KV_BF16_single",
+    "source": "fa3_kv_bf16_single.cu",
+    "symbol": "fa3_kv_bf16_single",
+    "k_stages": 2,
+    "v_stages": 2,
+    "barrier_bytes": 80,
+    "output_dtype": "bf16",
+    "consumer_wgs": 1,
+    "pingpong": false
+  },
+  {
+    "id": "fa3_kv_bf16_dual",
+    "label": "KV_BF16_dual",
+    "source": "fa3_kv_bf16_dual.cu",
+    "symbol": "fa3_kv_bf16_dual",
+    "k_stages": 2,
+    "v_stages": 2,
+    "barrier_bytes": 80,
+    "output_dtype": "bf16",
+    "consumer_wgs": 2,
+    "pingpong": false
+  },
+  {
+    "id": "fa3_kv_bf16_pingpong",
+    "label": "KV_BF16_pingpong",
+    "source": "fa3_kv_bf16_pingpong.cu",
+    "symbol": "fa3_kv_bf16_pingpong",
+    "k_stages": 2,
+    "v_stages": 2,
+    "barrier_bytes": 96,
+    "output_dtype": "bf16",
+    "consumer_wgs": 2,
+    "pingpong": true
+  }
+]

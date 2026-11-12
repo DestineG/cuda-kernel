@@ -1,0 +1,24 @@
+{
+  "status": "PASS",
+  "original_sources_unchanged": true,
+  "rounding_comparisons": 312,
+  "rounding_equal": 312,
+  "reproduction_command": [
+    "/root/miniconda3/bin/python",
+    "/root/autodl-tmp/fa3-double-v-output/runs/20261112-073802-double-v-output/harness/runners/reproduce.py",
+    "--artifact",
+    "/root/autodl-tmp/fa3-double-v-output/runs/20261112-073802-double-v-output",
+    "--output",
+    "/root/autodl-tmp/fa3-double-v-output/reproduction-smoke",
+    "--config",
+    "fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer_bf16_output_r64_c64_rr0_p40_a232_q64_kv64_o64",
+    "--case",
+    "c0150_ring",
+    "--case",
+    "c0156_ring"
+  ],
+  "total_shared_memory_unchanged_at_matched_parameters": true,
+  "harness_amendments": [
+    "Added matched.csv and rounding.csv presentation exports after validation; computation, tolerances and timing unchanged."
+  ]
+}

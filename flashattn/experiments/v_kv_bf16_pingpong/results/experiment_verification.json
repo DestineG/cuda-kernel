@@ -1,0 +1,51 @@
+{
+  "status": "PASS",
+  "original_source_hashes": true,
+  "reproduction": [
+    {
+      "family": "v",
+      "command": [
+        "/root/miniconda3/bin/python",
+        "/root/autodl-tmp/fa3-v-kv-pingpong/runs/20261112-083844-v-kv-bf16-pingpong-poolfix/harness/runners/reproduce.py",
+        "--artifact",
+        "/root/autodl-tmp/fa3-v-kv-pingpong/runs/20261112-083844-v-kv-bf16-pingpong-poolfix",
+        "--output",
+        "/root/autodl-tmp/fa3-v-kv-pingpong/reproduce-v",
+        "--config",
+        "fa3_v_bf16_pingpong_r64_c64_rr0_p40_a232_q64_kv64_o64",
+        "--case",
+        "c0150_ring",
+        "--case",
+        "c0156_ring"
+      ],
+      "status": "PASS"
+    },
+    {
+      "family": "kv",
+      "command": [
+        "/root/miniconda3/bin/python",
+        "/root/autodl-tmp/fa3-v-kv-pingpong/runs/20261112-083844-v-kv-bf16-pingpong-poolfix/harness/runners/reproduce.py",
+        "--artifact",
+        "/root/autodl-tmp/fa3-v-kv-pingpong/runs/20261112-083844-v-kv-bf16-pingpong-poolfix",
+        "--output",
+        "/root/autodl-tmp/fa3-v-kv-pingpong/reproduce-kv",
+        "--config",
+        "fa3_kv_bf16_pingpong_r64_c64_rr0_p40_a232_q64_kv64_o64",
+        "--case",
+        "c0150_ring",
+        "--case",
+        "c0156_ring"
+      ],
+      "status": "PASS"
+    }
+  ],
+  "schedule": "QK-ready handoff before softmax, including the final PV turn; an experimental schedule, not verbatim official FA3",
+  "limitations": [
+    "Causal consumers both iterate the union of their KV ranges; earlier Q rows can do excess masked work.",
+    "Timing alone does not prove hardware overlap; no profiler-based overlap measurement is claimed."
+  ],
+  "presentation_amendments": [
+    "Added external comparison.csv, findings.md and UI checks after measurements.",
+    "Reduced cell padding and rendered pingpong flags as yes/no; computation and timing unchanged."
+  ]
+}

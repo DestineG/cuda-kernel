@@ -191,7 +191,11 @@ void fa3_bf16_forward_kv_pipeline_qk_pv_overlap(
     size_t kv_end = cu_seqlens_kv[seq_idx + 1];
     size_t kv_lens = kv_end - kv_start;
     if constexpr (CAUSAL) {
-        assert(kv_lens >= q_lens);
+        // Abort on an unsupported causal shape without an __assertfail call.
+        if (kv_lens < q_lens) {
+            asm volatile("trap;");
+            return;
+        }
     }
     size_t num_kvtiles = (kv_lens + Bc - 1) / Bc;
     if (kv_lens == 0) return;
@@ -266,7 +270,10 @@ void fa3_bf16_forward_kv_pipeline_qk_pv_overlap(
         // arrive q consumer
         barrier_arrive(barrier_k_consumer);
 
-        for(size_t kvtile_offset = 0; kvtile_offset < kv_lens; kvtile_offset += Bc) {
+        // Prologue: compute P_0; there is no previous PV to submit.
+        {
+            const size_t kvtile_offset = 0;
+
             // wait k productor
             barrier_wait(barrier_k_productor, phase_k_productor);
             phase_k_productor ^= 1;
@@ -313,58 +320,10 @@ void fa3_bf16_forward_kv_pipeline_qk_pv_overlap(
                 }
             }
             wgmma_commit();
-        
-            if (kvtile_offset != 0) {
-                // wait v productor
-                barrier_wait(barrier_v_productor, phase_v_productor);
-                phase_v_productor ^= 1;
 
-                // new_o = old_o_scale + p@v
-                for(uint32_t mma_m = 0; mma_m < Br; mma_m += MMA_M) {
-                    for(uint32_t mma_n = 0; mma_n < HEAD_DIM; mma_n += MMA_N) {
-                        for(uint32_t mma_k = 0; mma_k < Bc; mma_k += MMA_K) {
-                            // mma_desc_regs_p
-                            uint32_t p_frag[MMA_K / 4];
-                            uint32_t dst = 0;
 
-                            for (uint32_t col = mma_k; col < mma_k + MMA_K; col += 8) {
-                                uint32_t fragment = col / MMA_N;
-                                uint32_t reg = ((col % MMA_N) / 8) * 2;
-
-                                p_frag[dst++] = regs_p[mma_m / MMA_M][fragment][reg];
-                                p_frag[dst++] = regs_p[mma_m / MMA_M][fragment][reg + 1];
-                            }
-
-                            // mma_desc_smem_v
-                            uint32_t offset = tma_tile_offset_swizzle128B<
-                                Bc, HEAD_DIM,
-                                BOX_KV_M, BOX_KV_N
-                            >(mma_k, mma_n, sizeof(__nv_bfloat16));
-                            uint64_t mma_desc_smem_V = create_smem_desc(
-                                smem_v + offset,
-                                16,
-                                8 * BOX_KV_N * sizeof(__nv_bfloat16),
-                                1,
-                                0
-                            );
-
-                            // wgmma
-                            wgmma_fence();
-                            wgmma_m64n64k16_rs(
-                                regs_o[mma_m / MMA_M][mma_n / MMA_N],
-                                p_frag,
-                                mma_desc_smem_V,
-                                true
-                            );
-                        }
-                    }
-                }
-                wgmma_commit();
-                wgmma_wait<1>();
-            }
-            else {
                 wgmma_wait<0>();
-            }
+
 
             // arrive k consumer
             barrier_arrive(barrier_k_consumer);
@@ -441,13 +400,7 @@ void fa3_bf16_forward_kv_pipeline_qk_pv_overlap(
                 regs_row_max[mma_m][1] = new_max[1];
             }
 
-            if (kvtile_offset != 0) {
-                // wait pv
-                wgmma_wait<0>();
 
-                // arrive v consumer
-                barrier_arrive(barrier_v_consumer);
-            }
 
             // new_l, p = apply_max_and_rowsum(old_l, s, new_max, factor)
             for (uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
@@ -491,7 +444,233 @@ void fa3_bf16_forward_kv_pipeline_qk_pv_overlap(
                     }
                 }
             }
-        }
+                }
+
+        // Steady state: every iteration has one previous PV.
+        for(size_t kvtile_offset = Bc; kvtile_offset < kv_lens; kvtile_offset += Bc) {
+
+            // wait k productor
+            barrier_wait(barrier_k_productor, phase_k_productor);
+            phase_k_productor ^= 1;
+
+            // s = q@k
+            wgmma_fence();
+            for(uint32_t mma_m = 0; mma_m < Br; mma_m += MMA_M) {
+                for(uint32_t mma_n = 0; mma_n < Bc; mma_n += MMA_N) {
+                    for(uint32_t mma_k = 0; mma_k < HEAD_DIM; mma_k += MMA_K) {
+                        // mma_desc_smem_q
+                        uint32_t offset = tma_tile_offset_swizzle128B<
+                            Br, HEAD_DIM,
+                            BOX_Q_M, BOX_Q_N
+                        >(mma_m, mma_k, sizeof(__nv_bfloat16));
+                        uint64_t mma_desc_smem_Q = create_smem_desc(
+                            smem_q + offset,
+                            16,
+                            8 * BOX_Q_N * sizeof(__nv_bfloat16),
+                            1,
+                            0
+                        );
+
+                        // mma_desc_smem_k
+                        offset = tma_tile_offset_swizzle128B<
+                            Bc, HEAD_DIM,
+                            BOX_KV_M, BOX_KV_N
+                        >(mma_n, mma_k, sizeof(__nv_bfloat16));
+                        uint64_t mma_desc_smem_K = create_smem_desc(
+                            smem_k + offset,
+                            16,
+                            8 * BOX_KV_N * sizeof(__nv_bfloat16),
+                            1,
+                            0
+                        );
+
+                        // wgmma
+                        wgmma_m64n64k16_ss(
+                            regs_sp[mma_m / MMA_M][mma_n / MMA_N],
+                            mma_desc_smem_Q,
+                            mma_desc_smem_K,
+                            mma_k != 0
+                        );
+                    }
+                }
+            }
+            wgmma_commit();
+
+
+                // wait v productor
+                barrier_wait(barrier_v_productor, phase_v_productor);
+                phase_v_productor ^= 1;
+
+                // new_o = old_o_scale + p@v
+                for(uint32_t mma_m = 0; mma_m < Br; mma_m += MMA_M) {
+                    for(uint32_t mma_n = 0; mma_n < HEAD_DIM; mma_n += MMA_N) {
+                        for(uint32_t mma_k = 0; mma_k < Bc; mma_k += MMA_K) {
+                            // mma_desc_regs_p
+                            uint32_t p_frag[MMA_K / 4];
+                            uint32_t dst = 0;
+
+                            for (uint32_t col = mma_k; col < mma_k + MMA_K; col += 8) {
+                                uint32_t fragment = col / MMA_N;
+                                uint32_t reg = ((col % MMA_N) / 8) * 2;
+
+                                p_frag[dst++] = regs_p[mma_m / MMA_M][fragment][reg];
+                                p_frag[dst++] = regs_p[mma_m / MMA_M][fragment][reg + 1];
+                            }
+
+                            // mma_desc_smem_v
+                            uint32_t offset = tma_tile_offset_swizzle128B<
+                                Bc, HEAD_DIM,
+                                BOX_KV_M, BOX_KV_N
+                            >(mma_k, mma_n, sizeof(__nv_bfloat16));
+                            uint64_t mma_desc_smem_V = create_smem_desc(
+                                smem_v + offset,
+                                16,
+                                8 * BOX_KV_N * sizeof(__nv_bfloat16),
+                                1,
+                                0
+                            );
+
+                            // wgmma
+                            wgmma_fence();
+                            wgmma_m64n64k16_rs(
+                                regs_o[mma_m / MMA_M][mma_n / MMA_N],
+                                p_frag,
+                                mma_desc_smem_V,
+                                true
+                            );
+                        }
+                    }
+                }
+                wgmma_commit();
+                wgmma_wait<1>();
+
+
+            // arrive k consumer
+            barrier_arrive(barrier_k_consumer);
+
+            // kv 尾块处理
+            if(kvtile_offset + Bc > kv_lens) {
+                for(uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
+                    for(uint32_t mma_n = 0; mma_n < Bc / MMA_N; mma_n++) {
+                        for(uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
+                            uint32_t elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8;
+                            if (elem_col >= num_last_kvtile_row) {
+                                regs_sp[mma_m][mma_n][mma_n8 * 4] = -INFINITY;
+                                regs_sp[mma_m][mma_n][mma_n8 * 4 + 2] = -INFINITY;
+                            }
+                            if (elem_col + 1 >= num_last_kvtile_row) {
+                                regs_sp[mma_m][mma_n][mma_n8 * 4 + 1] = -INFINITY;
+                                regs_sp[mma_m][mma_n][mma_n8 * 4 + 3] = -INFINITY;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // causal mask
+            if constexpr(CAUSAL) {
+                for (uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
+                    uint32_t mma_row = mma_m * MMA_M + warp_idx * 16;
+                    for (uint32_t mma_n = 0; mma_n < Bc / MMA_N; mma_n++) {
+                        for (uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
+                            size_t elem_row = (lane_idx / 4) + mma_row + qtile_idx * Br + kv_lens - q_lens;
+                            uint32_t elem_col = (lane_idx % 4) * 2 + mma_n * MMA_N + mma_n8 * 8 + kvtile_offset;
+                            if(elem_row < elem_col) {
+                                regs_sp[mma_m][mma_n][mma_n8 * 4] = -INFINITY;
+                            }
+                            if(elem_row < 1 + elem_col) {
+                                regs_sp[mma_m][mma_n][1 + mma_n8 * 4] = -INFINITY;
+                            }
+
+                            if(8 + elem_row < elem_col) {
+                                regs_sp[mma_m][mma_n][2 + mma_n8 * 4] = -INFINITY;
+                            }
+                            if(8 + elem_row < 1 + elem_col) {
+                                regs_sp[mma_m][mma_n][3 + mma_n8 * 4] = -INFINITY;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // new_m, factor = rowmax(old_m, s)
+            for (uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
+                float new_max[2] = {-INFINITY, -INFINITY};
+                for (uint32_t mma_n = 0; mma_n < Bc / MMA_N; mma_n++) {
+                    for (uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
+                        regs_sp[mma_m][mma_n][mma_n8 * 4] *= scale;
+                        regs_sp[mma_m][mma_n][1 + mma_n8 * 4] *= scale;
+                        regs_sp[mma_m][mma_n][2 + mma_n8 * 4] *= scale;
+                        regs_sp[mma_m][mma_n][3 + mma_n8 * 4] *= scale;
+                        float max0 = fmaxf(regs_sp[mma_m][mma_n][mma_n8 * 4], regs_sp[mma_m][mma_n][1 + mma_n8 * 4]);
+                        float max1 = fmaxf(regs_sp[mma_m][mma_n][2 + mma_n8 * 4], regs_sp[mma_m][mma_n][3 + mma_n8 * 4]);
+                        new_max[0] = fmaxf(new_max[0], max0);
+                        new_max[1] = fmaxf(new_max[1], max1);
+                    }
+                }
+                new_max[0] = fmaxf(new_max[0], __shfl_xor_sync(0xffffffff, new_max[0], 1));
+                new_max[0] = fmaxf(new_max[0], __shfl_xor_sync(0xffffffff, new_max[0], 2));
+                new_max[1] = fmaxf(new_max[1], __shfl_xor_sync(0xffffffff, new_max[1], 1));
+                new_max[1] = fmaxf(new_max[1], __shfl_xor_sync(0xffffffff, new_max[1], 2));
+                new_max[0] = fmaxf(new_max[0], regs_row_max[mma_m][0]);
+                new_max[1] = fmaxf(new_max[1], regs_row_max[mma_m][1]);
+                regs_row_factor[mma_m][0] = expf(regs_row_max[mma_m][0] - new_max[0]);
+                regs_row_factor[mma_m][1] = expf(regs_row_max[mma_m][1] - new_max[1]);
+                regs_row_max[mma_m][0] = new_max[0];
+                regs_row_max[mma_m][1] = new_max[1];
+            }
+
+
+                // wait pv
+                wgmma_wait<0>();
+
+                // arrive v consumer
+                barrier_arrive(barrier_v_consumer);
+
+
+            // new_l, p = apply_max_and_rowsum(old_l, s, new_max, factor)
+            for (uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
+                float new_sum[2] = {0, 0};
+                for (uint32_t mma_n = 0; mma_n < Bc / MMA_N; mma_n++) {
+                    for (uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
+                        regs_sp[mma_m][mma_n][mma_n8 * 4] = expf(regs_sp[mma_m][mma_n][mma_n8 * 4] - regs_row_max[mma_m][0]);
+                        regs_sp[mma_m][mma_n][1 + mma_n8 * 4] = expf(regs_sp[mma_m][mma_n][1 + mma_n8 * 4] - regs_row_max[mma_m][0]);
+                        regs_sp[mma_m][mma_n][2 + mma_n8 * 4] = expf(regs_sp[mma_m][mma_n][2 + mma_n8 * 4] - regs_row_max[mma_m][1]);
+                        regs_sp[mma_m][mma_n][3 + mma_n8 * 4] = expf(regs_sp[mma_m][mma_n][3 + mma_n8 * 4] - regs_row_max[mma_m][1]);
+                        float sum0 = regs_sp[mma_m][mma_n][mma_n8 * 4] + regs_sp[mma_m][mma_n][1 + mma_n8 * 4];
+                        float sum1 = regs_sp[mma_m][mma_n][2 + mma_n8 * 4] + regs_sp[mma_m][mma_n][3 + mma_n8 * 4];
+                        new_sum[0] += sum0;
+                        new_sum[1] += sum1;
+                        regs_p[mma_m][mma_n][mma_n8 * 4 / 2] = pack_bf16(
+                            regs_sp[mma_m][mma_n][mma_n8 * 4],
+                            regs_sp[mma_m][mma_n][1 + mma_n8 * 4]
+                        );
+                        regs_p[mma_m][mma_n][1 + mma_n8 * 4 / 2] = pack_bf16(
+                            regs_sp[mma_m][mma_n][2 + mma_n8 * 4],
+                            regs_sp[mma_m][mma_n][3 + mma_n8 * 4]
+                        );
+                    }
+                }
+                new_sum[0] += __shfl_xor_sync(0xffffffff, new_sum[0], 1);
+                new_sum[0] += __shfl_xor_sync(0xffffffff, new_sum[0], 2);
+                new_sum[1] += __shfl_xor_sync(0xffffffff, new_sum[1], 1);
+                new_sum[1] += __shfl_xor_sync(0xffffffff, new_sum[1], 2);
+                regs_row_sum[mma_m][0] = regs_row_sum[mma_m][0] * regs_row_factor[mma_m][0] + new_sum[0];
+                regs_row_sum[mma_m][1] = regs_row_sum[mma_m][1] * regs_row_factor[mma_m][1] + new_sum[1];
+            }
+
+            // old_o_scale = apply_factor(old_o, factor)
+            for(uint32_t mma_m = 0; mma_m < Br / MMA_M; mma_m++) {
+                for(uint32_t mma_n = 0; mma_n < HEAD_DIM / MMA_N; mma_n++) {
+                    for(uint32_t mma_n8 = 0; mma_n8 < MMA_N / 8; mma_n8++) {
+                        regs_o[mma_m][mma_n][mma_n8 * 4] *= regs_row_factor[mma_m][0];
+                        regs_o[mma_m][mma_n][1 + mma_n8 * 4] *= regs_row_factor[mma_m][0];
+                        regs_o[mma_m][mma_n][2 + mma_n8 * 4] *= regs_row_factor[mma_m][1];
+                        regs_o[mma_m][mma_n][3 + mma_n8 * 4] *= regs_row_factor[mma_m][1];
+                    }
+                }
+            }
+                }
 
         // wait v productor
         barrier_wait(barrier_v_productor, phase_v_productor);
@@ -627,7 +806,7 @@ void fa3_bf16_forward_kv_pipeline_qk_pv_overlap(
         if(warp_idx == 4 && lane_idx == 0) {
             uint32_t phase_k_consumer = 0;
             uint32_t phase_v_consumer = 0;
-            
+
             // tma load q
             barrier_expect_tx(
                 barrier_k_productor,

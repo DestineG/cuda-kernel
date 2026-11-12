@@ -18,6 +18,42 @@
 
 需要支持 SM90a 的工具链和 Hopper GPU。现有 `launcher.cu`、`benchmark.sh` 和 PyTorch wrapper **只调用 naive/FA1/FA2**；不会因为加入这些文件就自动测试 FA3。各 FA3 文件的演示 `main` 不启动计算，使用时应调用相应模板 launcher。
 
+## SM90 FA3 v1 对照版本
+
+原始 `fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1.cu` 保留不变，新增三份独立源码：
+
+| 文件后缀（均接在 `fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1` 后） | 改动 |
+|---|---|
+| [`_compile_opt.cu`](fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_opt.cu) | 首轮移到循环外；因果形状检查改为条件 trap，避免 __assertfail 调用 |
+| [`_mask_opt.cu`](fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_mask_opt.cu) | 完全合法的 KV 块跳过逐元素 causal mask；producer/consumer 同时裁掉全非法 KV 块 |
+| [`_compile_mask_opt.cu`](fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt.cu) | 同时应用上述两组改动 |
+
+新文件的 kernel 和 launcher 名称均追加对应后缀，例如 `fa3_bf16_forward_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_launcher`；模板参数顺序沿用原始 v1。每份文件独立编译，原 naive/FA1/FA2 launcher 不自动调用这些版本。
+
+组合版保留 v1 的调度：当前 softmax 的 exp/rowsum 在等待上一轮 PV 完成前执行，新 P 的打包及 O 的缩放在等待之后执行。首轮只等待一次 QK，没有上一轮 PV，也不需要初始化 P 来消除警告。
+
+mask 使用序列局部坐标，右下对齐语义不变。`kv_limit = kv_lens - q_lens + q_row_begin + num_qtile_row`，两侧循环共用该上界；有效尾块也按这个上界屏蔽。TMA 对最后部分块仍加载完整 box，越界/无贡献的元素由 mask 排除。
+
+验证范围：CUDA12.4.131 编译28个实例（64x64、D64/128、因果/非因果、重分配关闭/40+232，以及组合版128x128 D128）；约208万次CPU mask可见性比较通过。64x64的消警告版和组合版没有C7510/C7513；仅mask版保留原警告。组合版128x128 D128仍有C7511寄存器资源不足导致的串行化提示。主机GCC13使用allow-unsupported-compiler；后续已完成H800全量验证，见下方“工程化FA3测试”和独立实验说明。
+
+## v1 组合版的独立双缓冲实验
+
+以下三份文件基于 `fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt.cu`，原组合版保持不变。完整文件名在该前缀后追加：
+
+| 后缀 | K槽数 | V槽数 |
+|---|---:|---:|
+| [`_k_dbuffer.cu`](fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_k_dbuffer.cu) | 2 | 1 |
+| [`_v_dbuffer.cu`](fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_v_dbuffer.cu) | 1 | 2 |
+| [`_kv_dbuffer.cu`](fa3_bf16_sm90_kv_pipeline_qk_pv_overlap_v1_compile_mask_opt_kv_dbuffer.cu) | 2 | 2 |
+
+kernel/launcher名称也追加对应后缀，模板参数顺序保持一致。每份独立编译，不自动并入已有benchmark入口。
+
+K/V按各自tile编号取模选槽，各槽具有独立ready/free barrier和phase。consumer在QK完成后释放K，在PV完成后释放V；producer只在重用槽时等待free，发出当前K后可等待对应V槽。Q与输出复用一组独立握手，producer在输出阶段前排空所有尚未确认的K消费。最后一块V无需再释放，因为没有下一次槽位重用，consumer等待最后PV完成后才写回输出。
+
+Br=Bc=64、D128时，双K/双V分别占65536B数据+64B barrier；双KV占81920B数据+80B barrier。动态共享内存申请已按实际槽数更新。保留组合版的首轮分离、trap、因果裁剪、v1 softmax/PV重叠与寄存器重分配参数。
+
+本次CUDA12.4编译30个实例通过：三版本64x64、D64/128、因果/非因果、rr关闭/40+232，以及128x128 D128、TMA box行数128。64x64无C751x提示；128x128 D128仍有C7511。CPU抽象协议模型覆盖1～33块、完整/部分输出与19800种交错调度；这不能代替GPU正确性或同步检测。后续已完成H800全量GPU测试，默认和入选配置通过数值及四类sanitizer检查，详见下方。
+
 以下内容为导入的 naive/FA1/FA2 测试说明与历史结果，不能用来代表上述四个 SM90 FA3 的性能。
 
 ---
@@ -187,3 +223,24 @@ Measured on the current RTX 4090 setup with `warmup=3` and `iterations=20`:
 
 These values are device- and workload-dependent. Re-run the commands above
 on the target GPU when updating the results.
+
+## 工程化FA3测试
+
+[tests/README.md](tests/README.md)提供全部10个FA3版本的统一测试工具。源码/配置快照、编译、独立参数搜索、CPU正确性、sanitizer门槛、性能矩阵和报告生成在独立run中记录，支持恢复中断任务和归档。
+
+```bash
+# 从flashattn目录执行
+python tests/run.py inspect
+python tests/run.py all --config tests/configs/full.json --name all-fa3 --run-root /path/to/experiment-disk/fa3-runs
+python tests/run.py resume --run /path/to/run
+python tests/run.py report --run /path/to/run
+python tests/run.py archive --run /path/to/run
+```
+
+报告为report.html：左侧输入条件，中间kernel/超参数，右侧实际测试结果；支持筛选、排序和当前CSV导出，不显示相对值。工具和配置进入源码仓库，runs/、缓存及实验产物默认不跟踪。
+
+## BF16 输出与双 consumer 实验
+
+[experiments/README.md](experiments/README.md)收录独立的double_V输出类型对照和V/KV BF16 single、dual、ping-pong实验，包括六份CUDA源码、测试框架、参数与结果摘录。原FP32实现保留。
+
+全部10版本的H800运行覆盖157组正确性、268组性能输入和12组反序确认；6777条性能记录。基础版4个consumer=128候选在sanitizer下出现非有限值，已淘汰；容量超限单列。double_V输出实验2014条性能记录；V/KV双consumer实验4690条，修正CTA寄存器预算后完整重测通过。各实验适用范围和失败诊断见各自README及结果摘录。
